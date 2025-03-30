@@ -1,269 +1,58 @@
-import aiohttp
-import asyncio
-import requests
-import json
+import streamlit as st
+import pandas as pd
+import numpy as np
 from datetime import datetime
-import logging
+import requests
 import time
-import concurrent.futures
-import threading
+import json
+import os
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('api_client')
+# Set page configuration
+st.set_page_config(
+    page_title="Vehicle Analytics Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# For mapping YOLO class IDs to vehicle types
-VEHICLE_TYPE_MAPPING = {
-    2: "Car",
-    3: "Motorcycle",
-    5: "Bus",
-    7: "Truck"
-}
-
-# API endpoints
-BASE_URL = "http://13.233.118.66:3000"
-POST_VEHICLE_ENDPOINT = f"{BASE_URL}/PetrolPumps/details/"
-UPDATE_VEHICLE_ENDPOINT = f"{BASE_URL}/PetrolPumps/details"
-GET_VEHICLES_ENDPOINT = f"{BASE_URL}/PetrolPumps/details"
-
-# Thread pool for async operations
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-
-# In-memory queue for failed requests to retry later
-failed_requests_queue = []
-_is_retry_thread_running = False
-_retry_thread = None
-_lock = threading.Lock()
-
-class RetryableRequest:
-    def __init__(self, request_type, endpoint, payload, vehicle_id=None):
-        self.request_type = request_type  # 'POST' or 'PUT'
-        self.endpoint = endpoint
-        self.payload = payload
-        self.vehicle_id = vehicle_id
-        self.retry_count = 0
-        self.timestamp = time.time()
-    
-    def __str__(self):
-        return f"{self.request_type} {self.endpoint} - Payload: {self.payload}"
-
-def _start_retry_thread():
-    """Start a background thread to retry failed requests."""
-    global _is_retry_thread_running, _retry_thread
-    
-    with _lock:
-        if not _is_retry_thread_running:
-            _is_retry_thread_running = True
-            _retry_thread = threading.Thread(target=_retry_failed_requests, daemon=True)
-            _retry_thread.start()
-            logger.info("Started retry thread for failed API requests")
-
-def _retry_failed_requests():
-    """Background thread function that periodically retries failed requests."""
-    global _is_retry_thread_running, failed_requests_queue
-    
-    while _is_retry_thread_running:
-        try:
-            # Sleep to avoid CPU hogging
-            time.sleep(5)
-            
-            with _lock:
-                if not failed_requests_queue:
-                    continue
-                    
-                current_time = time.time()
-                requests_to_retry = []
-                
-                # Find requests that are due for retry (at least 5 seconds old)
-                for request in failed_requests_queue:
-                    if current_time - request.timestamp >= 5:
-                        requests_to_retry.append(request)
-                
-                # Remove the requests we're about to retry from the queue
-                if requests_to_retry:
-                    failed_requests_queue = [r for r in failed_requests_queue if r not in requests_to_retry]
-            
-            # Process the retries outside the lock
-            for request in requests_to_retry:
-                try:
-                    if request.request_type == 'POST':
-                        response = requests.post(
-                            request.endpoint,
-                            json=request.payload,
-                            timeout=10
-                        )
-                        if response.status_code == 201:
-                            logger.info(f"Successfully retried POST request: {request.endpoint}")
-                        else:
-                            # If still failing after 3 retries, log and drop
-                            if request.retry_count >= 3:
-                                logger.error(f"Failed to retry POST request after 3 attempts: {request.endpoint}")
-                            else:
-                                request.retry_count += 1
-                                request.timestamp = time.time()
-                                with _lock:
-                                    failed_requests_queue.append(request)
-                    
-                    elif request.request_type == 'PUT':
-                        put_endpoint = f"{request.endpoint}/{request.vehicle_id}"
-                        response = requests.put(
-                            put_endpoint,
-                            json=request.payload,
-                            timeout=10
-                        )
-                        if response.status_code == 200:
-                            logger.info(f"Successfully retried PUT request: {put_endpoint}")
-                        else:
-                            # If still failing after 3 retries, log and drop
-                            if request.retry_count >= 3:
-                                logger.error(f"Failed to retry PUT request after 3 attempts: {put_endpoint}")
-                            else:
-                                request.retry_count += 1
-                                request.timestamp = time.time()
-                                with _lock:
-                                    failed_requests_queue.append(request)
-                except Exception as e:
-                    logger.error(f"Error during retry: {str(e)}")
-                    if request.retry_count < 3:
-                        request.retry_count += 1
-                        request.timestamp = time.time()
-                        with _lock:
-                            failed_requests_queue.append(request)
-                    
-        except Exception as e:
-            logger.error(f"Error in retry thread: {str(e)}")
-
-def _queue_failed_request(request_type, endpoint, payload, vehicle_id=None):
-    """Add a failed request to the retry queue."""
-    global failed_requests_queue
-    
-    request = RetryableRequest(request_type, endpoint, payload, vehicle_id)
-    
-    with _lock:
-        failed_requests_queue.append(request)
-    
-    # Ensure the retry thread is running
-    _start_retry_thread()
-    
-    logger.info(f"Queued {request_type} request for retry: {endpoint}")
-
-async def post_vehicle_entry_async(petrol_pump_id, vehicle_type="Car", vehicle_id=None, entering_time=None, date=None):
-    """
-    Asynchronously post a new vehicle entry to the backend.
-    
-    Args:
-        petrol_pump_id (str): ID of the petrol pump
-        vehicle_type (str): Type of vehicle (default: "Car")
-        vehicle_id (str): Optional vehicle ID
-        entering_time (str): Time of entry (format: "HH:MM:SS")
-        date (str): Date of entry (format: "YYYY-MM-DD")
-    
-    Returns:
-        dict: Response from the server or None if request failed
-    """
-    # Set default values if not provided
-    if entering_time is None:
-        entering_time = datetime.now().strftime("%H:%M:%S")
-    
-    if date is None:
-        date = datetime.now().strftime("%Y-%m-%d")
-    
-    if vehicle_id is None:
-        # Generate a temporary vehicle ID - will be overwritten by server
-        time_component = datetime.now().strftime("%H%M%S-%Y%m%d")
-        vehicle_id = f"{time_component}-{vehicle_type[:2].upper()}"
-    
-    # Prepare the payload according to the specified format
-    payload = {
-        "petrolPumpID": petrol_pump_id,
-        "VehicleType": vehicle_type,
-        "PetrolPumpNumber": "1",  # Fixed as per requirements
-        "Helmet": True,           # Fixed as per requirements
-        "EnteringTime": entering_time,
-        "ExitTime": "",           # Empty at entry time
-        "FillingTime": "",        # Empty at entry time
-        "Date": date,
-        "ServerUpdate": True,     # Fixed as per requirements
-        "VehicleID": vehicle_id
+# Add custom CSS for styling
+st.markdown("""
+<style>
+    .header-style {
+        font-size: 25px;
+        font-weight: bold;
+        color: #2E86C1;
+        padding: 10px;
+        border-bottom: 2px solid #2E86C1;
     }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(POST_VEHICLE_ENDPOINT, json=payload, timeout=10) as response:
-                if response.status == 201:
-                    result = await response.json()
-                    logger.info(f"Successfully posted vehicle entry: {result.get('VehicleID', 'Unknown')}")
-                    return result
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to post vehicle entry. Status: {response.status}, Response: {error_text}")
-                    # Queue for retry
-                    _queue_failed_request('POST', POST_VEHICLE_ENDPOINT, payload)
-                    return None
-    except Exception as e:
-        logger.error(f"Exception during post_vehicle_entry_async: {str(e)}")
-        # Queue for retry
-        _queue_failed_request('POST', POST_VEHICLE_ENDPOINT, payload)
-        return None
-
-async def update_vehicle_exit_async(petrol_pump_id, vehicle_id, exit_time=None, filling_time=None, entry_time=None):
-    """
-    Asynchronously update a vehicle's exit information.
-    
-    Args:
-        petrol_pump_id (str): ID of the petrol pump
-        vehicle_id (str): The vehicle ID received from the server
-        exit_time (str): Time of exit (format: "HH:MM:SS")
-        filling_time (str): Duration of filling in the format "X seconds"
-        entry_time (str): Original entry time (for calculating filling time if not provided)
-    
-    Returns:
-        bool: True if update was successful, False otherwise
-    """
-    if exit_time is None:
-        exit_time = datetime.now().strftime("%H:%M:%S")
-    
-    # Calculate filling time if not provided
-    if filling_time is None and entry_time is not None:
-        try:
-            entry_dt = datetime.strptime(entry_time, "%H:%M:%S")
-            exit_dt = datetime.strptime(exit_time, "%H:%M:%S")
-            delta = exit_dt - entry_dt
-            filling_time = f"{delta.seconds} seconds"
-        except Exception as e:
-            logger.warning(f"Could not calculate filling time: {str(e)}")
-            filling_time = "unknown"
-    
-    # Prepare payload for the PUT request
-    payload = {
-        "ExitTime": exit_time,
-        "FillingTime": filling_time
+    .metric-card {
+        padding: 15px;
+        border-radius: 10px;
+        background-color: #F8F9F9;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        margin: 10px 0;
     }
-    
-    update_url = f"{UPDATE_VEHICLE_ENDPOINT}/{petrol_pump_id}/vehicle/{vehicle_id}"
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.put(update_url, json=payload, timeout=10) as response:
-                if response.status == 200:
-                    logger.info(f"Successfully updated vehicle exit: {vehicle_id}")
-                    return True
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to update vehicle exit. Status: {response.status}, Response: {error_text}")
-                    # Queue for retry
-                    _queue_failed_request('PUT', UPDATE_VEHICLE_ENDPOINT, payload, vehicle_id)
-                    return False
-    except Exception as e:
-        logger.error(f"Exception during update_vehicle_exit_async: {str(e)}")
-        # Queue for retry
-        _queue_failed_request('PUT', UPDATE_VEHICLE_ENDPOINT, payload, vehicle_id)
-        return False
+    .dataframe th {
+        background-color: #2E86C1 !important;
+        color: white !important;
+    }
+    .stButton button {
+        background-color: #2E86C1 !important;
+        color: white !important;
+        border-radius: 5px;
+    }
+    .source-selection {
+        padding: 15px;
+        border: 1px solid #ddd;
+        border-radius: 10px;
+        margin-bottom: 15px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-async def get_vehicle_details_async(petrol_pump_id, vehicle_id=None):
+# Simple API client functions
+def get_vehicle_details(petrol_pump_id, vehicle_id=None):
     """
-    Asynchronously get vehicle details from the server.
+    Get vehicle details from the API.
     
     Args:
         petrol_pump_id (str): ID of the petrol pump
@@ -272,127 +61,243 @@ async def get_vehicle_details_async(petrol_pump_id, vehicle_id=None):
     Returns:
         list or dict: Vehicle details from the server or None if request failed
     """
-    url = f"{GET_VEHICLES_ENDPOINT}/{petrol_pump_id}"
+    base_url = "http://13.233.118.66:3000"
+    endpoint = f"{base_url}/PetrolPumps/details/{petrol_pump_id}"
+    
     if vehicle_id:
-        url += f"/vehicle/{vehicle_id}"
+        endpoint += f"/vehicle/{vehicle_id}"
     
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to get vehicle details. Status: {response.status}, Response: {error_text}")
-                    return None
+        # Make request with timeout
+        response = requests.get(endpoint, timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"API Error: {response.status_code} - {response.text}")
+            return None
     except Exception as e:
-        logger.error(f"Exception during get_vehicle_details_async: {str(e)}")
+        st.error(f"Connection error: {str(e)}")
         return None
 
-# Synchronous wrappers for the async functions to maintain compatibility with the existing code
+def main():
+    # Initialize session state
+    if 'tracked_vehicles' not in st.session_state:
+        st.session_state.tracked_vehicles = {}
+    
+    st.markdown('<p class="header-style">Vehicle Analytics Dashboard</p>', unsafe_allow_html=True)
+    
+    # Add petrol pump ID input
+    col_filter1, col_filter2 = st.columns(2)
+    with col_filter1:
+        petrol_pump_id = st.text_input("🔧 Enter Petrol Pump ID", value="IOCL-1", help="Enter the Petrol Pump ID to fetch details")
+    
+    with col_filter2:
+        vehicle_id = st.text_input("🚗 Enter Vehicle ID (Optional)", help="Filter by specific vehicle if needed")
 
-def post_vehicle_entry(petrol_pump_id, vehicle_id=None, entering_time=None, date=None, vehicle_type="Car"):
-    """
-    Synchronous wrapper for post_vehicle_entry_async.
-    Submits the API request in a background thread.
-    """
-    loop = asyncio.new_event_loop()
-    
-    def _run_async():
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(
-            post_vehicle_entry_async(petrol_pump_id, vehicle_type, vehicle_id, entering_time, date)
-        )
-    
-    # Submit to thread pool
-    future = executor.submit(_run_async)
-    try:
-        result = future.result(timeout=0.1)  # Small timeout to avoid blocking
-        return result
-    except concurrent.futures.TimeoutError:
-        # The async operation is still running in the background
-        logger.info(f"Vehicle entry submission for {vehicle_id} is running in background")
-        return None
+    # Add refresh button and sample data option
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        refresh_data = st.button("🔄 Refresh Data", help="Fetch latest vehicle details from server")
+    with col2:
+        use_sample_data = st.checkbox("Use Sample Data", value=False)
 
-def update_vehicle_exit(petrol_pump_id, vehicle_id, exit_time=None, filling_time=None, entry_time=None):
-    """
-    Synchronous wrapper for update_vehicle_exit_async.
-    Submits the API request in a background thread.
-    """
-    loop = asyncio.new_event_loop()
-    
-    def _run_async():
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(
-            update_vehicle_exit_async(petrol_pump_id, vehicle_id, exit_time, filling_time, entry_time)
-        )
-    
-    # Submit to thread pool
-    future = executor.submit(_run_async)
-    try:
-        result = future.result(timeout=0.1)  # Small timeout to avoid blocking
-        return result
-    except concurrent.futures.TimeoutError:
-        # The async operation is still running in the background
-        logger.info(f"Vehicle exit update for {vehicle_id} is running in background")
-        return None
-
-def get_vehicle_details(petrol_pump_id, vehicle_id=None):
-    """
-    Synchronous wrapper for get_vehicle_details_async.
-    """
-    loop = asyncio.new_event_loop()
-    
-    def _run_async():
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(
-            get_vehicle_details_async(petrol_pump_id, vehicle_id)
-        )
-    
-    # For data retrieval, we actually wait for the result
-    future = executor.submit(_run_async)
-    try:
-        # Get the API response
-        api_data = future.result()
-        
-        # Early return if no data
-        if not api_data:
-            logger.warning(f"No data received from API for petrol_pump_id={petrol_pump_id}")
-            return []
-            
-        # Ensure we're working with a list for consistency
-        if isinstance(api_data, dict):
-            api_data = [api_data]
-        
-        # Process the data to make it safe
-        processed_data = []
-        for item in api_data:
+    if refresh_data:
+        if use_sample_data:
+            # Generate sample data
+            with st.spinner("Generating sample data..."):
+                sample_data = generate_sample_data()
+                st.session_state.tracked_vehicles = sample_data
+                st.success("✅ Sample data generated successfully!")
+        else:
             try:
-                # Create a processed item with default values for all required fields
-                processed_item = {
-                    'VehicleID': item.get('VehicleID', 'unknown'),
-                    'EnteringTime': item.get('EnteringTime', ''),
-                    'ExitTime': item.get('ExitTime', ''),
-                    'FillingTime': item.get('FillingTime', ''),
-                    'ServerConnected': "0",  # Default to not connected
-                    'ServerUpdate': False,   # Default to not updated
-                    'Date': item.get('Date', ''),
-                    'VehicleType': item.get('VehicleType', 'Car')
-                }
-                
-                # Try to determine if vehicle is active/connected
-                if 'ServerConnected' in item:
-                    processed_item['ServerConnected'] = item['ServerConnected']
-                
-                if 'ServerUpdate' in item:
-                    processed_item['ServerUpdate'] = item['ServerUpdate']
-                
-                processed_data.append(processed_item)
+                # Show loading indicator
+                with st.spinner("Fetching data from API..."):
+                    # Fetch data from API
+                    api_data = get_vehicle_details(petrol_pump_id, vehicle_id if vehicle_id else None)
+                    
+                    # Process API response
+                    if api_data and isinstance(api_data, list) and len(api_data) > 0:
+                        # Convert API data to tracked_vehicles format
+                        processed_data = {}
+                        
+                        for item in api_data:
+                            try:
+                                # Extract filling time duration safely
+                                duration = 0
+                                filling_time_str = item.get('FillingTime', '')
+                                if filling_time_str and isinstance(filling_time_str, str):
+                                    try:
+                                        # Extract number from string like "30 seconds"
+                                        duration_parts = filling_time_str.split()
+                                        if len(duration_parts) > 0:
+                                            duration = float(duration_parts[0])
+                                    except (ValueError, IndexError):
+                                        pass
+                                
+                                # Get vehicle ID safely
+                                vehicle_id = item.get('VehicleID', f"unknown-{len(processed_data)}")
+                                
+                                # Get entry and exit times
+                                entry_time = item.get('EnteringTime', '')
+                                exit_time = item.get('ExitTime', '')
+                                
+                                # Add to processed data
+                                processed_data[vehicle_id] = {
+                                    'vehicle_id': vehicle_id,
+                                    'entry_time': entry_time,
+                                    'exit_time': exit_time,
+                                    'duration': duration,
+                                    'in_roi': False,  # Default to False
+                                    'last_seen': exit_time if exit_time else entry_time,
+                                    'vehicle_type': item.get('VehicleType', 'Unknown')
+                                }
+                            except Exception as e:
+                                st.error(f"Error processing vehicle: {str(e)}")
+                        
+                        st.session_state.tracked_vehicles = processed_data
+                        st.success("✅ Data updated successfully!")
+                    else:
+                        st.warning("⚠️ No data found for this Petrol Pump ID")
+            
             except Exception as e:
-                logger.error(f"Error processing item from API: {e}")
+                st.error(f"🔴 Error fetching data: {str(e)}")
+
+    # Display tracked vehicle data
+    if st.session_state.tracked_vehicles:
+        col1, col2, col3 = st.columns(3)
+        
+        # Current Vehicles in ROI
+        with col1:
+            current_vehicles = len([v for v in st.session_state.tracked_vehicles.values() 
+                                if v.get('in_roi', False) and not v.get('exit_time')])
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Active Vehicles</h3>
+                <p style="font-size: 24px; margin: 0;">{current_vehicles}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Total Vehicles
+        with col2:
+            total_vehicles = len(st.session_state.tracked_vehicles)
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Total Vehicles</h3>
+                <p style="font-size: 24px; margin: 0;">{total_vehicles}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Average Filling Time
+        with col3:
+            valid_times = [v.get('duration', 0) for v in st.session_state.tracked_vehicles.values() 
+                        if v.get('duration', 0) > 0]
+            avg_time = np.mean(valid_times) if len(valid_times) > 0 else 0
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Avg. Filling Time</h3>
+                <p style="font-size: 24px; margin: 0;">{avg_time:.1f} secs</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Enhanced Data Table
+        st.subheader("Detailed Vehicle Logs")
+        try:
+            df = pd.DataFrame.from_dict(st.session_state.tracked_vehicles, orient='index')
+            
+            # Add status indicator column
+            df['status'] = df.apply(
+                lambda row: 'Active 🟢' if pd.isna(row.get('exit_time')) or row.get('exit_time') == '' else 'Completed 🔴',
+                axis=1
+            )
+            
+            # Convert duration from seconds to a readable format
+            df['duration_str'] = df['duration'].apply(
+                lambda x: f"{int(x // 60)}m {int(x % 60)}s" if not pd.isna(x) and x > 0 else ""
+            )
+            
+            # Ensure all expected columns exist
+            for col in ['vehicle_id', 'entry_time', 'exit_time', 'vehicle_type', 'last_seen']:
+                if col not in df.columns:
+                    df[col] = ""
+            
+            if 'duration_str' not in df.columns:
+                df['duration_str'] = ""
                 
-        return processed_data
-    except Exception as e:
-        logger.error(f"Error in get_vehicle_details: {str(e)}")
-        return []
+            if 'status' not in df.columns:
+                df['status'] = "Unknown"
+            
+            # Display enhanced table
+            st.dataframe(
+                df[['vehicle_id', 'entry_time', 'exit_time', 
+                'duration_str', 'status', 'vehicle_type', 'last_seen']],
+                column_config={
+                    "vehicle_id": "Vehicle ID",
+                    "entry_time": "Entry Time",
+                    "exit_time": "Exit Time",
+                    "duration_str": "Duration",
+                    "status": "Status",
+                    "vehicle_type": "Vehicle Type",
+                    "last_seen": "Last Update"
+                },
+                use_container_width=True,
+                height=500
+            )
+            
+            # Add export button
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Export to CSV",
+                data=csv,
+                file_name=f"vehicle_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime='text/csv'
+            )
+        except Exception as e:
+            st.error(f"Error processing vehicle data: {str(e)}")
+            st.exception(e)
+    else:
+        st.info("ℹ️ No vehicle data available. Use the 'Refresh Data' button to load data.")
+
+def generate_sample_data(num_vehicles=20):
+    """Generate sample vehicle data for demonstration purposes."""
+    sample_data = {}
+    vehicle_types = ["Car", "Motorcycle", "Bus", "Truck"]
+    
+    current_time = datetime.now()
+    
+    for i in range(num_vehicles):
+        # Generate random entry time (within last 2 hours)
+        minutes_ago = np.random.randint(5, 120)
+        entry_time = (current_time - pd.Timedelta(minutes=minutes_ago)).strftime("%H:%M:%S")
+        
+        # For 70% of vehicles, generate exit time
+        has_exit = np.random.random() < 0.7
+        
+        # Generate random duration for completed vehicles
+        duration = 0
+        exit_time = ""
+        if has_exit:
+            duration = np.random.randint(30, 300)  # 30 to 300 seconds
+            exit_dt = (current_time - pd.Timedelta(minutes=minutes_ago) + 
+                      pd.Timedelta(seconds=duration))
+            exit_time = exit_dt.strftime("%H:%M:%S")
+        
+        # Generate random vehicle type
+        vehicle_type = np.random.choice(vehicle_types)
+        
+        # Create vehicle entry
+        vehicle_id = f"SAMPLE-{i+1:03d}"
+        sample_data[vehicle_id] = {
+            'vehicle_id': vehicle_id,
+            'entry_time': entry_time,
+            'exit_time': exit_time,
+            'duration': duration,
+            'in_roi': not has_exit,  # In ROI if no exit time
+            'last_seen': exit_time if exit_time else entry_time,
+            'vehicle_type': vehicle_type
+        }
+    
+    return sample_data
+
+if __name__ == "__main__":
+    main()
