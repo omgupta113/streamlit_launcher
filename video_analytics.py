@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from api_client import get_vehicle_details
+import requests
 import time
+import json
 import os
 
 # Set page configuration
@@ -48,6 +49,37 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Simple API client functions
+def get_vehicle_details(petrol_pump_id, vehicle_id=None):
+    """
+    Get vehicle details from the API.
+    
+    Args:
+        petrol_pump_id (str): ID of the petrol pump
+        vehicle_id (str, optional): If provided, get details for a specific vehicle
+    
+    Returns:
+        list or dict: Vehicle details from the server or None if request failed
+    """
+    base_url = "http://13.233.118.66:3000"
+    endpoint = f"{base_url}/PetrolPumps/details/{petrol_pump_id}"
+    
+    if vehicle_id:
+        endpoint += f"/vehicle/{vehicle_id}"
+    
+    try:
+        # Make request with timeout
+        response = requests.get(endpoint, timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"API Error: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Connection error: {str(e)}")
+        return None
+
 def main():
     # Initialize session state
     if 'tracked_vehicles' not in st.session_state:
@@ -63,11 +95,12 @@ def main():
     with col_filter2:
         vehicle_id = st.text_input("🚗 Enter Vehicle ID (Optional)", help="Filter by specific vehicle if needed")
 
-    # Add refresh button
-    refresh_data = st.button("🔄 Refresh Data", help="Fetch latest vehicle details from server")
-
-    # Option to use sample data
-    use_sample_data = st.checkbox("Use Sample Data", value=False, help="Use generated sample data instead of API call")
+    # Add refresh button and sample data option
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        refresh_data = st.button("🔄 Refresh Data", help="Fetch latest vehicle details from server")
+    with col2:
+        use_sample_data = st.checkbox("Use Sample Data", value=False)
 
     if refresh_data:
         if use_sample_data:
@@ -99,8 +132,8 @@ def main():
                                         duration_parts = filling_time_str.split()
                                         if len(duration_parts) > 0:
                                             duration = float(duration_parts[0])
-                                    except (ValueError, IndexError) as e:
-                                        st.warning(f"Could not parse filling time '{filling_time_str}'")
+                                    except (ValueError, IndexError):
+                                        pass
                                 
                                 # Get vehicle ID safely
                                 vehicle_id = item.get('VehicleID', f"unknown-{len(processed_data)}")
@@ -159,7 +192,7 @@ def main():
         with col3:
             valid_times = [v.get('duration', 0) for v in st.session_state.tracked_vehicles.values() 
                         if v.get('duration', 0) > 0]
-            avg_time = np.mean(valid_times) if valid_times else 0
+            avg_time = np.mean(valid_times) if len(valid_times) > 0 else 0
             st.markdown(f"""
             <div class="metric-card">
                 <h3>Avg. Filling Time</h3>
@@ -173,16 +206,26 @@ def main():
             df = pd.DataFrame.from_dict(st.session_state.tracked_vehicles, orient='index')
             
             # Add status indicator column
-            df['status'] = np.where(
-                df['exit_time'].isnull() | (df['exit_time'] == ''), 
-                'Active 🟢', 
-                'Completed 🔴'
+            df['status'] = df.apply(
+                lambda row: 'Active 🟢' if pd.isna(row.get('exit_time')) or row.get('exit_time') == '' else 'Completed 🔴',
+                axis=1
             )
             
             # Convert duration from seconds to a readable format
             df['duration_str'] = df['duration'].apply(
                 lambda x: f"{int(x // 60)}m {int(x % 60)}s" if not pd.isna(x) and x > 0 else ""
             )
+            
+            # Ensure all expected columns exist
+            for col in ['vehicle_id', 'entry_time', 'exit_time', 'vehicle_type', 'last_seen']:
+                if col not in df.columns:
+                    df[col] = ""
+            
+            if 'duration_str' not in df.columns:
+                df['duration_str'] = ""
+                
+            if 'status' not in df.columns:
+                df['status'] = "Unknown"
             
             # Display enhanced table
             st.dataframe(
@@ -198,8 +241,7 @@ def main():
                     "last_seen": "Last Update"
                 },
                 use_container_width=True,
-                height=500,
-                hide_index=True
+                height=500
             )
             
             # Add export button
@@ -212,6 +254,7 @@ def main():
             )
         except Exception as e:
             st.error(f"Error processing vehicle data: {str(e)}")
+            st.exception(e)
     else:
         st.info("ℹ️ No vehicle data available. Use the 'Refresh Data' button to load data.")
 
