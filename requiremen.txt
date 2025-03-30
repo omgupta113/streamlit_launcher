@@ -11,7 +11,7 @@ filterpy>=1.4.5
 scipy>=1.10.0
 
 # For API client
-aiohttp>=3.8.5
+aiohttp==3.11.14 
 requests>=2.31.0
 asyncio>=3.4.3
 
