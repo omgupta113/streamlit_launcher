@@ -1,0 +1,44 @@
+# Core dependencies
+streamlit>=1.27.0
+numpy>=1.24.0
+pandas>=2.0.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# For video processing and object detection
+ultralytics>=8.0.0
+filterpy>=1.4.5
+scipy>=1.10.0
+
+# For API client
+aiohttp>=3.8.5
+requests>=2.31.0
+asyncio>=3.4.3
+
+# For data visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.18.0
+altair>=5.0.0
+
+# Streamlit extensions
+streamlit-extras>=0.3.0
+
+# For file operations
+python-dotenv>=1.0.0
+
+# For data export
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+
+# Time handling
+pytz>=2023.3
+
+# For temporary file handling
+tempfile>=0.0.1
+
+# For concurrent processing
+concurrent-futures>=3.0.5
+
+# Utility libraries
+tqdm>=4.66.0
