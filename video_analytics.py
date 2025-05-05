@@ -61,7 +61,7 @@ def get_vehicle_details(petrol_pump_id, vehicle_id=None):
     Returns:
         list or dict: Vehicle details from the server or None if request failed
     """
-    base_url = "http://13.233.118.66:3000"
+    base_url = "http://13.203.197.204:3000"
     endpoint = f"{base_url}/PetrolPumps/details/{petrol_pump_id}"
     
     if vehicle_id:
